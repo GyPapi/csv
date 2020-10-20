@@ -35,6 +35,8 @@ DEFINE CLASS CSVProcessor AS Custom
 	DropExistingTable = .F.
 	* Cursor fields / CSV Columns mapping collection
 	ADD OBJECT FieldMapping AS Collection
+	* CSV Columns type collection
+	ADD OBJECT FieldTypes AS Collection
 	* multiple cursor support
 	MultipleCursors = .F.
 	ADD OBJECT MultipleCursorsNames AS Collection
@@ -542,7 +544,19 @@ DEFINE CLASS CSVProcessor AS Custom
 				TRY
 					DO CASE
 					CASE m.CreateCursor
-						m.Retype = This.ColumnType(m.Importer(m.ImporterIndex), m.ColumnsNames(m.ColumnIndex))
+						m.Retype = ""
+						TRY
+							IF This.FieldTypes.Count > 0
+								IF EMPTY(This.FieldTypes.GetKey(1))
+									m.Retype = This.FieldTypes.Item(m.ColumnIndex)
+								ELSE
+									m.Retype = This.FieldTypes.Item(m.CSVColumns(m.ColumnIndex))
+								ENDIF
+							ENDIF
+						CATCH
+							m.Retype = ""
+						ENDTRY
+						m.Retype = EVL(m.Retype, This.ColumnType(m.Importer(m.ImporterIndex), m.ColumnsNames(m.ColumnIndex)))
 					CASE This.FieldMapping.Count = 0
 						m.Retype = TYPE(This.WorkArea + "." + FIELD(m.ColumnIndex, This.WorkArea))
 					CASE EMPTY(This.FieldMapping.GetKey(1))
@@ -572,14 +586,14 @@ DEFINE CLASS CSVProcessor AS Custom
 					m.CursorFields(m.ColumnIndex, 2) = "T"
 					m.CursorFields(m.ColumnIndex, 3) = 8
 				* Double
-				CASE m.Retype == "B" OR m.Retype == "Y" OR m.Retype == "N"
+				CASE m.Retype $ "BYN"
 					m.CursorFields(m.ColumnIndex, 2) = "B"
 					m.CursorFields(m.ColumnIndex, 3) = 8
 					m.CursorFields(m.ColumnIndex, 4) = 4
-				* Varchar()
+				* Char() or Varchar()
 				CASE LEFT(m.Retype, 1) == "V"
 					m.CursorFields(m.ColumnIndex, 2) = "V"
-					m.CursorFields(m.ColumnIndex, 3) = EVL(VAL(SUBSTR(m.Retype, 2)), 1)
+					m.CursorFields(m.ColumnIndex, 3) = EVL(VAL(SUBSTR(m.Retype, 2)), 10)
 				* or leave it as a Memo
 				ENDCASE
 
@@ -710,17 +724,17 @@ DEFINE CLASS CSVProcessor AS Custom
 							* field not mapped, does not exist, or it's of General type: source column may be deactivated
 							m.ActiveColumns(m.ColumnIndex + m.ImporterSegment) = .F.
 						CASE ISNULL(m.ColumnText)
-							&TargetColumn. = .NULL.
+							STORE .NULL. TO (m.TargetColumn)
 						CASE m.CursorFields(m.ColumnIndex, 2) $ "IB"
-							&TargetColumn. = NVL(This.ScanNumber(m.ColumnText), 0)
+							STORE NVL(This.ScanNumber(m.ColumnText), 0) TO (m.TargetColumn)
 						CASE m.CursorFields(m.ColumnIndex, 2) == "L"
-							&TargetColumn. = NVL(This.ScanLogical(m.ColumnText), .F.)
+							STORE NVL(This.ScanLogical(m.ColumnText), .F.) TO (m.TargetColumn)
 						CASE m.CursorFields(m.ColumnIndex, 2) $ "DT"
-							&TargetColumn. = NVL(This.ScanDate(m.ColumnText, m.CursorFields(m.ColumnIndex, 2) == "T"), {})
+							STORE NVL(This.ScanDate(m.ColumnText, m.CursorFields(m.ColumnIndex, 2) == "T"), {}) TO (m.TargetColumn)
 						CASE TYPE(m.TargetColumn) $ "WQ"
-							&TargetColumn. = NVL(This.ScanBinary(m.ColumnText), "")
+							STORE NVL(This.ScanBinary(m.ColumnText), "") TO (m.TargetColumn)
 						OTHERWISE
-							&TargetColumn. = m.ColumnText
+							STORE m.ColumnText TO (m.TargetColumn) 
 						ENDCASE
 					ENDFOR
 
@@ -1020,6 +1034,7 @@ DEFINE CLASS CSVProcessor AS Custom
 
 		TRY
 			m.TempBuffer = FILETOSTR(m.Filename)
+			STRCONV(m.TempBuffer, 9)
 		CATCH
 			m.TempBuffer = .NULL.
 		ENDTRY
@@ -1562,17 +1577,45 @@ DEFINE CLASS CSVProcessor AS Custom
 
 			OTHERWISE
 
+				DO CASE
 				* a digit sets a part with fixed length (for instance, %4Y)
-				IF ISDIGIT(m.ChPattern)
+				CASE ISDIGIT(m.ChPattern)
 					m.ScanPart = LEFT(m.Scanned, VAL(m.ChPattern))
 					m.Scanned = SUBSTR(m.Scanned, VAL(m.ChPattern) + 1)
 					m.ChPattern = LEFT(m.Pattern, 1)
 					m.Pattern = SUBSTR(m.Pattern, 2)
-				ELSE
-					* if not fixed, the part ends at the next literal character (or end of source string)
+
+				* for contiguous pattern parts, skip characters to be scanned depending on part type
+				CASE LEFT(m.Pattern, 1) == "%"
+					m.ScanPart = ""
+					DO CASE
+					* numeric parts
+					CASE m.ChPattern $ "YMDhms"
+						DO WHILE ISDIGIT(LEFT(m.Scanned, 1))
+							m.ScanPart = m.ScanPart + LEFT(m.Scanned, 1)
+							m.Scanned = SUBSTR(m.Scanned, 2)
+						ENDDO
+					* text parts
+					CASE m.ChPattern == "N"
+						DO WHILE !ISDIGIT(LEFT(m.Scanned, 1)) AND !EMPTY(m.Scanned)
+							m.ScanPart = m.ScanPart + LEFT(m.Scanned, 1)
+							m.Scanned = SUBSTR(m.Scanned, 2)
+						ENDDO
+					* meridian parts
+					CASE m.ChPattern == "p"
+						m.ScanPart = LEFT(m.Scanned, LEN(This.AnteMeridian))
+						m.Scanned = SUBSTR(m.Scanned, LEN(This.AnteMeridian) + 1)
+					* just advance one character....
+					OTHERWISE
+						m.ScanPart = LEFT(m.Scanned, 1)
+						m.Scanned = SUBSTR(m.Scanned, 2)
+					ENDCASE
+
+				OTHERWISE
+					* if not fixed or contiguous, the part ends at the next literal character (or end of source string)
 					m.ScanPart = STREXTRACT(m.Scanned, "", LEFT(m.Pattern, 1), 1, 2)
 					m.Scanned = SUBSTR(m.Scanned, LEN(m.ScanPart) + 1)
-				ENDIF
+				ENDCASE
 
 				DO CASE
 				* %Y = year
